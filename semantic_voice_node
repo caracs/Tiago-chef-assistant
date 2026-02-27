@@ -1,0 +1,691 @@
+#!/usr/bin/env python3
+# semantic_voice_node.py (modificato: pubblica /robot_feedback)
+"""
+Nodo di interfaccia NL -> azioni robotiche (navigation + pick/place/return).
+Modifiche principali:
+ - migliorata estrazione dei luoghi in _find_places_in_text (ordinale + 'tavolo1'/'tavolo 1' / 'tavolo1' senza spazio)
+ - ora restituisce i luoghi nell'ordine di comparsa nella frase (prima = sorgente, seconda = destinazione)
+ - log aggiuntivi per debug
+"""
+import rospy
+import tf2_ros
+import threading
+from std_msgs.msg import String
+from geometry_msgs.msg import PoseStamped, Quaternion
+import tf.transformations as tft
+import re
+import time
+import os
+import json
+
+# try optional imports (darknet_ros, vision_msgs, visualization_msgs)
+try:
+    from darknet_ros_msgs.msg import BoundingBoxes as DarknetBoundingBoxes
+    from darknet_ros_msgs.msg import BoundingBox as DarknetBoundingBox
+    _HAS_DARKNET = True
+except Exception:
+    _HAS_DARKNET = False
+
+try:
+    from vision_msgs.msg import Detection2DArray as VisionDetection2DArray
+    _HAS_VISION_MSGS = True
+except Exception:
+    _HAS_VISION_MSGS = False
+
+try:
+    from visualization_msgs.msg import MarkerArray as VizMarkerArray
+    _HAS_VIZ = True
+except Exception:
+    _HAS_VIZ = False
+
+def yaw_to_quaternion(yaw: float) -> Quaternion:
+    q = tft.quaternion_from_euler(0, 0, yaw)
+    return Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+
+NUM_WORDS_IT = {
+    "uno": "1", "due": "2", "tre": "3", "quattro": "4", "cinque": "5",
+    "sei": "6", "sette": "7", "otto": "8", "nove": "9", "dieci": "10",
+    "primo": "1", "secondo": "2", "terzo": "3"
+}
+
+PICK_KEYWORDS = ["prendi", "prendere", "prendilo", "prendimi", "afferra", "prendi l'oggetto"]
+PLACE_KEYWORDS = ["mettilo", "metti", "posa", "posizionalo", "lascia", "porta", "portalo", "metti sul", "porta sul"]
+RETURN_KEYWORDS = ["riportami", "riportamelo", "riportare", "riportami indietro", "riportamelo indietro", "riportaci", "riportami qui"]
+
+# Topic used by DispensaInspector to suppress local NL handling while it asks questions
+SUPPRESS_TOPIC = "/suppress_local_nl"
+
+class SemanticVoiceNode:
+    def __init__(self):
+        rospy.init_node("semantic_voice_node", anonymous=False)
+
+        # params (read after init_node)
+        self.map_frame = rospy.get_param("~map_frame", "map")
+        self.robot_base_frame = rospy.get_param("~robot_base_frame", "base_footprint")
+        self._suppress_timeout = float(os.getenv("SUPPRESS_TIMEOUT", rospy.get_param("~suppress_timeout", 30.0)))
+        default_detection_topics = rospy.get_param("~detection_topics", ["/detections", "/detected_objects", "/vision/detections", "/object_detections", "/detected_ingredients"])
+        self._detection_topics_cfg = default_detection_topics
+
+        self.tf_buf = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buf)
+
+        self.goal_pub = rospy.Publisher("/move_base_simple/goal", PoseStamped, queue_size=1)
+        self.arrival_actions_pub = rospy.Publisher("/arrival_actions_str", String, queue_size=1)
+
+        # NEW: publisher di feedback leggibile dal terminale utente
+        self.feedback_pub = rospy.Publisher("/robot_feedback", String, queue_size=4)
+
+        # robot speech (per parlare / TTS)
+        self.robot_speech_pub = rospy.Publisher("/robot_speech", String, queue_size=4)
+
+        # suppression topic
+        self._suppress_local = False
+        self._suppress_ts = 0.0
+        rospy.Subscriber(SUPPRESS_TOPIC, String, self._suppress_cb, queue_size=1)
+
+        rospy.Subscriber("/voice_commands", String, self.cb_voice_cmd, queue_size=1)
+        rospy.Subscriber("/arrival_actions_result", String, self._arrival_result_cb, queue_size=1)
+
+        # dynamic subscription to detection topics (best-effort)
+        self._subscribe_detection_topics()
+
+        self._lock = threading.Lock()
+        self._waiting_for_pick_result = False
+        self._waiting_for_place_result = False
+        self._follow_up_action = None
+        self._expected_return_pose = None
+        self._destination_place = None
+        self._destination_pose = None
+        self._destination_quat = None
+        self._pick_start_time = None
+
+        self.semantic_places = rospy.get_param("/semantic_places", {})
+        rospy.loginfo("semantic_voice_node: semantic_places loaded: %s", ",".join(list(self.semantic_places.keys())))
+        rospy.loginfo("semantic_voice_node ready. Listening on /voice_commands")
+
+    def _suppress_cb(self, msg: String):
+        try:
+            val = msg.data.strip().lower() if msg and msg.data else ""
+            if val == "on":
+                self._suppress_local = True
+                self._suppress_ts = time.time()
+                rospy.loginfo("semantic_voice_node: suppression ON (ts=%.3f)", self._suppress_ts)
+            elif val == "off":
+                self._suppress_local = False
+                self._suppress_ts = 0.0
+                rospy.loginfo("semantic_voice_node: suppression OFF")
+            else:
+                rospy.logdebug("semantic_voice_node: suppression topic got unknown value '%s' (ignoring)", val)
+        except Exception as e:
+            rospy.logwarn("semantic_voice_node: error in _suppress_cb: %s", str(e))
+
+    def _check_and_reset_suppression_if_stale(self):
+        if self._suppress_local:
+            elapsed = time.time() - (self._suppress_ts or 0.0)
+            if elapsed > self._suppress_timeout:
+                rospy.logwarn("semantic_voice_node: suppression stale (%.1f s > %.1f s). Auto-resetting suppression.",
+                              elapsed, self._suppress_timeout)
+                self._suppress_local = False
+                self._suppress_ts = 0.0
+
+    # helper per feedback (pubblica anche in roslog)
+    def _feedback(self, text: str):
+        try:
+            self.feedback_pub.publish(String(data=text))
+        except Exception:
+            pass
+        rospy.loginfo("[VOICE_FEEDBACK] %s", text)
+
+    def _say(self, text: str):
+        """Breve wrapper per pubblicare su /robot_speech (TTS)"""
+        try:
+            self.robot_speech_pub.publish(String(data=text))
+        except Exception:
+            pass
+        rospy.loginfo("[ROBOT_SPEECH] %s", text)
+
+    def _lookup_current_pose(self, timeout=2.0):
+        try:
+            t = self.tf_buf.lookup_transform(self.map_frame, self.robot_base_frame, rospy.Time(0), rospy.Duration(timeout))
+            x = t.transform.translation.x
+            y = t.transform.translation.y
+            z = t.transform.translation.z
+            q = t.transform.rotation
+            return (x, y, z, q)
+        except Exception as e:
+            rospy.logwarn("Failed to lookup current pose: %s", str(e))
+            return None
+
+    def _publish_goal_from_place(self, place_name: str) -> bool:
+        p = None
+        if place_name in self.semantic_places:
+            p = self.semantic_places.get(place_name)
+        else:
+            for k in self.semantic_places.keys():
+                if k.lower() == place_name.lower() or place_name.lower() in k.lower():
+                    p = self.semantic_places.get(k)
+                    place_name = k
+                    break
+        if not p:
+            rospy.logerr("Place '%s' not found in /semantic_places", place_name)
+            self._feedback(f"Non riconosco il luogo '{place_name}'.")
+            return False
+        x, y, z, yaw = float(p[0]), float(p[1]), float(p[2]), float(p[3])
+        ps = PoseStamped()
+        ps.header.stamp = rospy.Time.now()
+        ps.header.frame_id = self.map_frame
+        ps.pose.position.x = x
+        ps.pose.position.y = y
+        ps.pose.position.z = z
+        ps.pose.orientation = yaw_to_quaternion(yaw)
+        self.goal_pub.publish(ps)
+        self._feedback(f"Sto andando a {place_name}.")
+        rospy.loginfo("Published PoseStamped to /move_base_simple/goal for place '%s': (%.3f, %.3f, yaw=%.3f)", place_name, x, y, yaw)
+        return True
+
+    def _arrival_result_cb(self, msg: String):
+        if not msg or not msg.data:
+            return
+        val = msg.data.strip().lower()
+        rospy.loginfo("semantic_voice_node: arrival_actions_result received: %s", val)
+        with self._lock:
+            if val == "success":
+                if self._waiting_for_pick_result:
+                    self._feedback("Pick completato con successo.")
+                    self._waiting_for_pick_result = False
+                    if self._follow_up_action == "return":
+                        if self._expected_return_pose is not None:
+                            x,y,z,q = self._expected_return_pose
+                            ps = PoseStamped()
+                            ps.header.stamp = rospy.Time.now()
+                            ps.header.frame_id = self.map_frame
+                            ps.pose.position.x = float(x)
+                            ps.pose.position.y = float(y)
+                            ps.pose.position.z = float(z)
+                            ps.pose.orientation = q
+                            self.goal_pub.publish(ps)
+                            self._feedback("Sto tornando al punto di partenza.")
+                        else:
+                            self._feedback("Impossibile tornare: posizione di partenza non salvata.")
+                        self._follow_up_action = None
+                        self._expected_return_pose = None
+                    elif self._follow_up_action == "place":
+                        self.arrival_actions_pub.publish(String(data="place"))
+                        self._feedback("Mi sto portando al luogo di destinazione per posare l'oggetto.")
+                        if self._destination_pose is not None:
+                            x,y,z,yaw = self._destination_pose
+                            ps = PoseStamped()
+                            ps.header.stamp = rospy.Time.now()
+                            ps.header.frame_id = self.map_frame
+                            ps.pose.position.x = float(x)
+                            ps.pose.position.y = float(y)
+                            ps.pose.position.z = float(z)
+                            ps.pose.orientation = yaw_to_quaternion(float(yaw))
+                            self.goal_pub.publish(ps)
+                            rospy.loginfo("Published destination PoseStamped to /move_base_simple/goal for place '%s': (%.3f, %.3f)", self._destination_place, x, y)
+                            self._waiting_for_place_result = True
+                        else:
+                            self._feedback("Destinazione non disponibile, non posso posare.")
+                        self._follow_up_action = None
+                        self._destination_place = None
+                    else:
+                        self._feedback("Operazione di presa completata, nessuna azione successiva.")
+                        self._follow_up_action = None
+                elif self._waiting_for_place_result:
+                    self._feedback("Place completato con successo.")
+                    self._waiting_for_place_result = False
+                else:
+                    rospy.logdebug("arrival result success but not expecting it (no waiting flags).")
+            elif val == "failure":
+                self._feedback("Operazione fallita.")
+                self._waiting_for_pick_result = False
+                self._waiting_for_place_result = False
+                self._follow_up_action = None
+                self._expected_return_pose = None
+                self._destination_place = None
+                self._destination_pose = None
+
+    def _normalize_text(self, text: str) -> str:
+        t = text.lower()
+        for w, d in NUM_WORDS_IT.items():
+            t = re.sub(r"\b{}\b".format(re.escape(w)), d, t)
+        # keep alphanum and spaces (digits preserved)
+        t = re.sub(r"[^\w\s]", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    def _find_places_in_text(self, text: str):
+        """
+        Improved ordered matching:
+         - normalize text (replace 'uno'->'1', remove punctuation)
+         - find all explicit 'tavolo <numero>' occurrences (kept in order of appearance)
+         - find occurrences of semantic_places keys as whole-words (kept in order)
+         - also attempt to find collapsed forms like 'tavolo1' in original text
+         - returns list of place keys found in order of appearance
+        """
+        found = []
+        if not text:
+            return found
+
+        txt_norm = self._normalize_text(text)
+        rospy.logdebug("semantic_voice_node: normalized text for place-finding: '%s'", txt_norm)
+
+        matches = []  # (pos, place_key)
+
+        # 1) find explicit "tavolo <num>" occurrences in order
+        for m in re.finditer(r"\btavolo\s*(\d+)\b", txt_norm):
+            n = m.group(1)
+            cand = f"tavolo{n}"
+            if cand in self.semantic_places:
+                matches.append((m.start(), cand))
+
+        # 2) find direct whole-word occurrences of semantic_places keys (preserving order)
+        #    use normalized form of keys for matching (lowercased)
+        for k in self.semantic_places.keys():
+            k_lower = k.lower()
+            # try as whole-word in normalized text
+            for m in re.finditer(r"\b" + re.escape(k_lower) + r"\b", txt_norm):
+                matches.append((m.start(), k))
+
+        # 3) handle collapsed forms like "tavolo1" (no space) by searching in original lowercased string without punctuation
+        raw_compact = re.sub(r"[^\w]", "", text.lower())
+        for k in self.semantic_places.keys():
+            k_compact = k.lower().replace(" ", "")
+            idx = raw_compact.find(k_compact)
+            if idx != -1:
+                # try to approximate a position in normalized text by searching for first token match
+                m2 = re.search(r"\b" + re.escape(k.lower().split()[0]) + r"\b", txt_norm)
+                pos_est = m2.start() if m2 else idx
+                matches.append((pos_est, k))
+
+        # sort matches by position and deduplicate preserving first occurrence order
+        matches_sorted = sorted(matches, key=lambda x: x[0])
+        for _, key in matches_sorted:
+            if key not in found:
+                found.append(key)
+
+        # 4) fallback: if no specific place found but the word 'tavolo' exists, try sensible defaults
+        if not found:
+            if re.search(r"\btavolo\b", txt_norm):
+                if "tavolo1" in self.semantic_places:
+                    found.append("tavolo1")
+                elif "tavolo" in self.semantic_places:
+                    found.append("tavolo")
+                else:
+                    tavoli = [k for k in self.semantic_places.keys() if k.startswith("tavolo")]
+                    if len(tavoli) == 1:
+                        found.append(tavoli[0])
+
+        rospy.logdebug("semantic_voice_node: places found (ordered): %s", str(found))
+        return found
+
+    def cb_voice_cmd(self, msg: String):
+        # reset suppression if stale
+        self._check_and_reset_suppression_if_stale()
+
+        # if suppression is active, ignore local NL handling completely
+        if self._suppress_local:
+            rospy.loginfo("semantic_voice_node: suppression active -> ignoring voice command.")
+            return
+
+        if not msg or not msg.data:
+            return
+        text = msg.data.strip()
+        rospy.loginfo("NL command: %s", text)
+
+        lowered = text.lower()
+        wants_pick = any(w in lowered for w in PICK_KEYWORDS)
+        wants_place_word = any(w in lowered for w in PLACE_KEYWORDS)
+        wants_return_word = any(w in lowered for w in RETURN_KEYWORDS)
+
+        # improved place detection (ordered)
+        places_found = self._find_places_in_text(text)
+        rospy.logdebug("Places found in NL text: %s", str(places_found))
+
+        # If we detected a place explicitly, perform navigation to it (covers "primo", "1", "tavolo 1", ecc.)
+        if places_found and not wants_pick and not wants_place_word:
+            # user likely asked to go to that place: publish goal
+            place = places_found[0]
+            self._feedback(f"Sto andando a {place}.")
+            self._publish_goal_from_place(place)
+            return
+
+        follow_up = None
+        dest_place_key = None
+
+        if wants_place_word:
+            follow_up = "place"
+            # Better: interpret first found as source (if pick present) and second as destination if present
+            if len(places_found) >= 2:
+                source_place = places_found[0]
+                dest_place_key = places_found[1]
+            elif len(places_found) == 1:
+                # single place: ambiguous — assume destination if phrase contains 'posalo' after the place,
+                # otherwise assume it indicates source. Heuristic: check relative position of 'posalo' or place word
+                single = places_found[0]
+                # if 'posalo' or 'mettilo' occurs AFTER the detected place substring, treat it as destination
+                norm = self._normalize_text(text)
+                place_word_regex = re.escape(single.lower().replace(" ", " "))
+                # crude heuristic: if 'pos' verb is after first occurrence of place in normalized text -> destination
+                first_pos = norm.find(single.lower().replace(" ", " "))
+                if first_pos >= 0:
+                    pos_after = re.search(r"\b(posa|metti|mettilo|porta|lascia)\b", norm)
+                    if pos_after and pos_after.start() > first_pos:
+                        dest_place_key = single
+                    else:
+                        # otherwise treat it as destination (safer choice) — but log ambiguity
+                        dest_place_key = single
+                else:
+                    dest_place_key = single
+            else:
+                # no explicit place found: try numeric words like 'secondo' or 'primo'
+                if re.search(r"\bsecondo\b|\b2\b|\bdue\b", lowered):
+                    if "tavolo2" in self.semantic_places:
+                        dest_place_key = "tavolo2"
+                elif re.search(r"\bprimo\b|\b1\b|\buno\b", lowered):
+                    if "tavolo1" in self.semantic_places:
+                        dest_place_key = "tavolo1"
+                if not dest_place_key:
+                    self._feedback("Non riesco a determinare la destinazione per 'mettilo'.")
+                    return
+        elif wants_return_word:
+            follow_up = "return"
+        elif wants_pick:
+            follow_up = "return"
+
+        if wants_pick:
+            source_place_key = None
+            if places_found:
+                source_place_key = places_found[0]
+            else:
+                # try some fallbacks
+                if "tavolo" in self.semantic_places:
+                    source_place_key = "tavolo"
+                elif "tavolo1" in self.semantic_places:
+                    source_place_key = "tavolo1"
+                else:
+                    m = re.search(r"tavolo\s*(\d+)", lowered)
+                    if m:
+                        candidate = f"tavolo{m.group(1)}"
+                        if candidate in self.semantic_places:
+                            source_place_key = candidate
+
+            if not source_place_key:
+                self._feedback("Non riesco a determinare il tavolo da cui prendere l'oggetto.")
+                rospy.logerr("Could not determine source place for pick from NL text. Aborting.")
+                return
+
+            self._feedback(f"Ho capito: vado a {source_place_key} per prendere l'oggetto.")
+            curr = self._lookup_current_pose(timeout=2.0)
+            if curr is None:
+                self._feedback("Non posso determinare la mia posizione attuale, annullo l'azione.")
+                rospy.logerr("Cannot determine current robot pose -> aborting pick-and-*")
+                return
+            (cx, cy, cz, cq) = curr
+
+            self.arrival_actions_pub.publish(String(data="pick"))
+            self._feedback("Alla mia prossima arrivata eseguirò il pick.")
+
+            with self._lock:
+                self._waiting_for_pick_result = True
+                self._expected_return_pose = (cx, cy, cz, cq)
+                self._follow_up_action = follow_up
+                if follow_up == "place" and dest_place_key:
+                    self._destination_place = dest_place_key
+                    dp = self.semantic_places.get(dest_place_key)
+                    if dp:
+                        self._destination_pose = (float(dp[0]), float(dp[1]), float(dp[2]), float(dp[3]))
+                        self._destination_quat = yaw_to_quaternion(float(dp[3]))
+                    else:
+                        self._feedback(f"Destinazione {dest_place_key} non trovata.")
+                else:
+                    self._destination_place = None
+                    self._destination_pose = None
+                    self._destination_quat = None
+                self._pick_start_time = time.time()
+
+            ok = self._publish_goal_from_place(source_place_key)
+            if not ok:
+                with self._lock:
+                    self._waiting_for_pick_result = False
+                    self._follow_up_action = None
+                    self._expected_return_pose = None
+                return
+
+            self._feedback("Inizio movimento verso il tavolo per il pick. Ti aggiorno quando arrivo.")
+            return
+
+        # navigation by place name (immediate) - fallback: also try normalized matching
+        for place_name in self.semantic_places.keys():
+            normalized_place = place_name.lower()
+            if normalized_place in lowered or normalized_place.replace(" ", "") in lowered.replace(" ", ""):
+                self._feedback(f"Sto andando a {place_name}.")
+                self._publish_goal_from_place(place_name)
+                return
+
+        # if we reach here -> no local match
+        self._feedback("Non ho riconosciuto il comando localmente; inoltro al servizio di interpretazione.")
+        rospy.logwarn("No local NL match; forwarding to LLM pipeline (if configured).")
+
+    # ----- Detection subscription helpers -----
+    def _subscribe_detection_topics(self):
+        """
+        Subscribe dynamically to topics that look like detection outputs.
+        Strategy:
+         - read a configured list of candidate topic names (~detection_topics)
+         - also look at currently published topics (rospy.get_published_topics) and subscribe to those whose name contains detection keywords
+         - choose subscription callback based on message type if importable (String, darknet, vision_msgs, MarkerArray)
+         - fallback: try subscribing as String (wrapped in try/except)
+        """
+        # candidate names from config
+        candidate_topics = list(self._detection_topics_cfg)
+
+        # examine currently published topics and add likely candidates
+        try:
+            published = rospy.get_published_topics()
+            for topic, ttype in published:
+                lname = topic.lower()
+                if any(k in lname for k in ("detect", "object", "people", "person", "bounding", "marker", "walking")):
+                    if topic not in candidate_topics:
+                        candidate_topics.append(topic)
+        except Exception:
+            published = []
+
+        # attempt subscribing, picking the best callback for known types
+        for topic in candidate_topics:
+            # skip duplicate subscription attempts
+            try:
+                rospy.logdebug("semantic_voice_node: considering subscription to detection topic '%s'", topic)
+                # find type from published list if possible
+                ttype = None
+                for t, tt in published:
+                    if t == topic:
+                        ttype = tt
+                        break
+
+                subscribed = False
+                # If topic type is known, attempt to subscribe with the right class
+                if ttype:
+                    if "std_msgs/String" in ttype:
+                        rospy.Subscriber(topic, String, self._detection_cb_string, queue_size=2)
+                        subscribed = True
+                    elif _HAS_DARKNET and ("darknet_ros_msgs/BoundingBoxes" in ttype or "darknet_ros_msgs/BoundingBox" in ttype):
+                        rospy.Subscriber(topic, DarknetBoundingBoxes, self._detection_cb_darknet, queue_size=2)
+                        subscribed = True
+                    elif _HAS_VISION_MSGS and ("vision_msgs/Detection2DArray" in ttype):
+                        rospy.Subscriber(topic, VisionDetection2DArray, self._detection_cb_vision, queue_size=2)
+                        subscribed = True
+                    elif _HAS_VIZ and ("visualization_msgs/MarkerArray" in ttype):
+                        rospy.Subscriber(topic, VizMarkerArray, self._detection_cb_markerarray, queue_size=2)
+                        subscribed = True
+
+                # if not subscribed yet, attempt generic String subscription (best-effort)
+                if not subscribed:
+                    try:
+                        rospy.Subscriber(topic, String, self._detection_cb_string, queue_size=2)
+                        subscribed = True
+                        rospy.loginfo("semantic_voice_node: subscribed to detection topic '%s' as String (best-effort)", topic)
+                    except Exception:
+                        # can't subscribe as String (type mismatch), skip or try darknet if available
+                        if _HAS_DARKNET:
+                            try:
+                                rospy.Subscriber(topic, DarknetBoundingBoxes, self._detection_cb_darknet, queue_size=2)
+                                subscribed = True
+                                rospy.loginfo("semantic_voice_node: subscribed to detection topic '%s' as DarknetBoundingBoxes (fallback)", topic)
+                            except Exception:
+                                pass
+                        if _HAS_VISION_MSGS and not subscribed:
+                            try:
+                                rospy.Subscriber(topic, VisionDetection2DArray, self._detection_cb_vision, queue_size=2)
+                                subscribed = True
+                                rospy.loginfo("semantic_voice_node: subscribed to detection topic '%s' as VisionDetection2DArray (fallback)", topic)
+                            except Exception:
+                                pass
+                if subscribed:
+                    rospy.loginfo("semantic_voice_node: detection subscriber active on '%s'", topic)
+            except Exception as e:
+                rospy.logdebug("semantic_voice_node: failed to subscribe to '%s': %s", topic, str(e))
+
+    # --------- detection callbacks for various message types ----------
+    def _detection_cb_string(self, msg: String):
+        # reuse generic parser
+        try:
+            raw = msg.data if msg and msg.data else ""
+            self._process_detection_raw(raw)
+        except Exception as e:
+            rospy.logwarn("Error in _detection_cb_string: %s", e)
+
+    def _detection_cb_darknet(self, msg):
+        # darknet_ros_msgs/BoundingBoxes
+        try:
+            labels = []
+            # msg.bounding_boxes is a list of BoundingBox
+            for bb in getattr(msg, "bounding_boxes", []) or []:
+                # bounding box has 'Class' or 'class' or 'id'
+                if hasattr(bb, "Class"):
+                    labels.append(str(bb.Class))
+                elif hasattr(bb, "classe"):
+                    labels.append(str(bb.classe))
+                elif hasattr(bb, "class_id"):
+                    labels.append(str(bb.class_id))
+                elif hasattr(bb, "id"):
+                    labels.append(str(bb.id))
+            if not labels:
+                return
+            raw = ",".join(labels)
+            self._process_detection_raw(raw)
+        except Exception as e:
+            rospy.logwarn("Error in _detection_cb_darknet: %s", e)
+
+    def _detection_cb_vision(self, msg):
+        # vision_msgs/Detection2DArray
+        try:
+            labels = []
+            for det in getattr(msg, "detections", []) or []:
+                # each detection may contain results with hypothesis/class_id
+                results = getattr(det, "results", None)
+                if results:
+                    for r in results:
+                        if hasattr(r, "id"):
+                            labels.append(str(r.id))
+                        elif hasattr(r, "hypothesis"):
+                            labels.append(str(r.hypothesis))
+                        elif hasattr(r, "name"):
+                            labels.append(str(r.name))
+            if not labels:
+                return
+            raw = ",".join(labels)
+            self._process_detection_raw(raw)
+        except Exception as e:
+            rospy.logwarn("Error in _detection_cb_vision: %s", e)
+
+    def _detection_cb_markerarray(self, msg):
+        try:
+            labels = []
+            for m in getattr(msg, "markers", []) or []:
+                if hasattr(m, "text") and m.text:
+                    labels.append(m.text)
+                elif hasattr(m, "ns") and m.ns:
+                    labels.append(m.ns)
+            if not labels:
+                return
+            raw = ",".join(labels)
+            self._process_detection_raw(raw)
+        except Exception as e:
+            rospy.logwarn("Error in _detection_cb_markerarray: %s", e)
+
+    def _process_detection_raw(self, raw: str):
+        """
+        Parse raw payload (String or synthesized) and publish concise feedback and salutations.
+        """
+        try:
+            if not raw:
+                return
+            # attempt JSON decoding
+            labels = []
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    for it in parsed:
+                        if isinstance(it, dict):
+                            # dict with label/class/name
+                            for k in ("label","class","name"):
+                                if k in it:
+                                    labels.append(str(it[k]))
+                                    break
+                        else:
+                            labels.append(str(it))
+                elif isinstance(parsed, dict):
+                    # get likely fields
+                    for k in ("label","class","name","object"):
+                        if k in parsed:
+                            labels.append(str(parsed[k]))
+                    if not labels:
+                        # fallback to keys
+                        labels = list(parsed.keys())
+                elif isinstance(parsed, str):
+                    labels = [parsed]
+            except Exception:
+                # fallback: split comma/semicolon/newline
+                parts = [p.strip() for p in re.split(r"[,\n;]+", raw) if p.strip()]
+                labels = parts if parts else [raw.strip()]
+
+            if not labels:
+                return
+
+            # normalize
+            labels_norm = [l.lower() for l in labels if l and l.strip()]
+            if not labels_norm:
+                return
+
+            # choose primary label for display
+            display = labels_norm[0]
+            feedback_text = f"vedo {display}"
+            try:
+                self.feedback_pub.publish(String(data=feedback_text))
+            except Exception:
+                pass
+            rospy.loginfo("[DETECTION] %s (raw: %s)", feedback_text, raw)
+
+            # detect human/person presence
+            person_keywords = ('person','persona','human','uomo','donna','people','walking_person','person_detected','person_detector')
+            is_person = any(any(pk in ln for pk in person_keywords) for ln in labels_norm)
+
+            if is_person:
+                # greet via robot_speech and publish a friendly feedback as well
+                try:
+                    self.robot_speech_pub.publish(String(data="Ciao umano!"))
+                except Exception:
+                    pass
+                rospy.loginfo("[DETECTION] person detected -> greeted with 'Ciao umano!'")
+
+        except Exception as e:
+            rospy.logwarn("Error in _process_detection_raw: %s", str(e))
+
+
+def main():
+    node = SemanticVoiceNode()
+    rospy.spin()
+
+if __name__ == "__main__":
+    main()

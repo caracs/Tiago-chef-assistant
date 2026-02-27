@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+# coding: utf-8
+"""
+pick_and_place_server.py - versione estesa: aggiunge PlaceLocation fallback con approach/retreat/posture
+- Assicura detach/remove dopo place e query diagnostica.
+- Parametricità su: end_effector_link, links_to_allow_contact, gripper_joint_names, gripper_open_positions,
+  place_drop_distance, preplace/post_retreat distances.
+"""
+import rospy
+from spherical_grasps_server import SphericalGrasps
+from actionlib import SimpleActionClient, SimpleActionServer
+from moveit_commander import PlanningSceneInterface
+from moveit_msgs.msg import Grasp, PickupAction, PickupGoal, PickupResult, MoveItErrorCodes
+from moveit_msgs.msg import PlaceAction, PlaceGoal, PlaceResult, PlaceLocation, GripperTranslation
+from geometry_msgs.msg import Pose, PoseStamped, PoseArray, Vector3Stamped, Vector3, Quaternion
+from tiago_pick_demo.msg import PickUpPoseAction, PickUpPoseGoal, PickUpPoseResult, PickUpPoseFeedback
+from moveit_msgs.srv import GetPlanningScene, GetPlanningSceneRequest, GetPlanningSceneResponse
+from std_srvs.srv import Empty, EmptyRequest
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from copy import deepcopy
+import copy
+import time
+
+moveit_error_dict = {}
+for name in MoveItErrorCodes.__dict__.keys():
+    if not name[:1] == '_':
+        code = MoveItErrorCodes.__dict__[name]
+        moveit_error_dict[code] = name
+
+
+def createPickupGoal(group="arm_torso", target="part",
+                     grasp_pose=PoseStamped(),
+                     possible_grasps=[],
+                     links_to_allow_contact=None):
+    pug = PickupGoal()
+    pug.target_name = target
+    pug.group_name = group
+    pug.possible_grasps.extend(possible_grasps)
+    pug.allowed_planning_time = 35.0
+    pug.planning_options.planning_scene_diff.is_diff = True
+    pug.planning_options.planning_scene_diff.robot_state.is_diff = True
+    pug.planning_options.plan_only = False
+    pug.planning_options.replan = True
+    pug.planning_options.replan_attempts = 1
+    pug.allowed_touch_objects = []
+    pug.attached_object_touch_links = []
+    if links_to_allow_contact:
+        try:
+            pug.attached_object_touch_links.extend(links_to_allow_contact)
+        except Exception:
+            pass
+    return pug
+
+
+def createPlaceGoal(place_pose,
+                    place_locations,
+                    group="arm_torso",
+                    target="part",
+                    links_to_allow_contact=None):
+    placeg = PlaceGoal()
+    placeg.group_name = group
+    placeg.attached_object_name = target
+
+    # defensive: ensure PlaceLocation headers reference the correct frame
+    default_frame = ""
+    try:
+        if place_pose and getattr(place_pose, "header", None) and place_pose.header.frame_id:
+            default_frame = place_pose.header.frame_id
+    except Exception:
+        default_frame = ""
+
+    normalized_locations = []
+    for pl in place_locations:
+        try:
+            if hasattr(pl, 'place_pose') and getattr(pl.place_pose, 'header', None) is not None:
+                if not pl.place_pose.header.frame_id:
+                    pl.place_pose.header.frame_id = default_frame
+            elif hasattr(pl, 'location') and getattr(pl.location, 'header', None) is not None:
+                if not pl.location.header.frame_id:
+                    pl.location.header.frame_id = default_frame
+            elif isinstance(pl, PoseStamped):
+                if not pl.header.frame_id:
+                    pl.header.frame_id = default_frame
+        except Exception:
+            pass
+        normalized_locations.append(pl)
+
+    placeg.place_locations = normalized_locations
+    placeg.allowed_planning_time = 15.0
+    placeg.planning_options.planning_scene_diff.is_diff = True
+    placeg.planning_options.planning_scene_diff.robot_state.is_diff = True
+    placeg.planning_options.plan_only = False
+    placeg.planning_options.replan = True
+    placeg.planning_options.replan_attempts = 1
+    placeg.allowed_touch_objects = ['<octomap>']
+    if links_to_allow_contact:
+        try:
+            placeg.allowed_touch_objects.extend(links_to_allow_contact)
+        except Exception:
+            pass
+    return placeg
+
+
+class PickAndPlaceServer(object):
+    def __init__(self):
+        rospy.loginfo("Initializing PickAndPlaceServer (extended)...")
+        self.sg = SphericalGrasps()
+
+        # action clients
+        self.pickup_ac = SimpleActionClient('/pickup', PickupAction)
+        self.pickup_ac.wait_for_server()
+        self.place_ac = SimpleActionClient('/place', PlaceAction)
+        self.place_ac.wait_for_server()
+
+        self.scene = PlanningSceneInterface()
+        self.scene_srv = rospy.ServiceProxy('/get_planning_scene', GetPlanningScene)
+        self.scene_srv.wait_for_service()
+        self.clear_octomap_srv = rospy.ServiceProxy('/clear_octomap', Empty)
+        self.clear_octomap_srv.wait_for_service()
+
+        # params
+        self.object_height = rospy.get_param('~object_height', 0.05)
+        self.object_width = rospy.get_param('~object_width', 0.05)
+        self.object_depth = rospy.get_param('~object_depth', 0.05)
+
+        self.links_to_allow_contact = rospy.get_param('~links_to_allow_contact', [])
+        self.end_effector_link = rospy.get_param('~end_effector_link', 'arm_tool_link')
+
+        # place tuning params
+        self.place_drop_distance = float(rospy.get_param('~place_drop_distance', 0.05))  # how much lower to go for drop
+        self.preplace_desired_distance = float(rospy.get_param('~preplace_desired_distance', 0.10))
+        self.preplace_min_distance = float(rospy.get_param('~preplace_min_distance', 0.02))
+        self.post_retreat_desired = float(rospy.get_param('~post_retreat_desired', 0.08))
+        self.post_retreat_min = float(rospy.get_param('~post_retreat_min', 0.02))
+
+        # gripper joint names + open positions (optional)
+        self.gripper_joint_names = rospy.get_param('~gripper_joint_names', [])
+        self.gripper_open_positions = rospy.get_param('~gripper_open_positions', [])
+
+        rospy.loginfo("links_to_allow_contact: %s", str(self.links_to_allow_contact))
+        rospy.loginfo("end_effector_link: %s", str(self.end_effector_link))
+        rospy.loginfo("place_drop_distance: %.3f", self.place_drop_distance)
+        rospy.loginfo("gripper_joints: %s", str(self.gripper_joint_names))
+
+        # servers
+        self.pick_as = SimpleActionServer('/pickup_pose', PickUpPoseAction, execute_cb=self.pick_cb, auto_start=False)
+        self.pick_as.start()
+        self.place_as = SimpleActionServer('/place_pose', PickUpPoseAction, execute_cb=self.place_cb, auto_start=False)
+        self.place_as.start()
+
+    def pick_cb(self, goal):
+        error_code = self.grasp_object(goal.object_pose)
+        p_res = PickUpPoseResult()
+        p_res.error_code = error_code
+        if error_code != MoveItErrorCodes.SUCCESS:
+            self.pick_as.set_aborted(p_res)
+        else:
+            self.pick_as.set_succeeded(p_res)
+
+    def place_cb(self, goal):
+        error_code = self.place_object(goal.object_pose)
+        p_res = PickUpPoseResult()
+        p_res.error_code = error_code
+        if error_code != MoveItErrorCodes.SUCCESS:
+            self.place_as.set_aborted(p_res)
+        else:
+            self.place_as.set_succeeded(p_res)
+
+    def wait_for_planning_scene_object(self, object_name='part', timeout=8.0):
+        gps_req = GetPlanningSceneRequest()
+        gps_req.components.components = gps_req.components.WORLD_OBJECT_NAMES
+        start = time.time()
+        while not rospy.is_shutdown() and (time.time() - start) < timeout:
+            try:
+                gps_resp = self.scene_srv.call(gps_req)
+                for collision_obj in gps_resp.scene.world.collision_objects:
+                    if collision_obj.id == object_name:
+                        return True
+            except Exception:
+                pass
+            rospy.sleep(0.3)
+        return False
+
+    def grasp_object(self, object_pose):
+        rospy.loginfo("Preparing planning scene for pick; cleaning old objects")
+        try:
+            try:
+                self.scene.remove_attached_object(self.end_effector_link, "part")
+            except TypeError:
+                try:
+                    self.scene.remove_attached_object("part", self.end_effector_link)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            try:
+                self.scene.remove_world_object("part")
+                self.scene.remove_world_object("table")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        try:
+            self.clear_octomap_srv.call(EmptyRequest())
+        except Exception:
+            pass
+        rospy.sleep(0.4)
+
+        op = deepcopy(object_pose)
+        try:
+            op.pose.position.z += 0.016
+        except Exception:
+            pass
+
+        self.scene.add_box("part", op, (self.object_depth, self.object_width, self.object_height))
+        table_pose = deepcopy(op)
+        table_height = max(0.01, op.pose.position.z - 0.016 - (self.object_height / 2.0) + 0.015)
+        table_pose.pose.position.x = op.pose.position.x
+        table_pose.pose.position.y = op.pose.position.y
+        table_pose.pose.position.z = table_height / 2.0
+        self.scene.add_box("table", table_pose, (self.table_depth if hasattr(self,'table_depth') else 1.2,
+                                                self.table_width if hasattr(self,'table_width') else 1.0,
+                                                table_height))
+
+        self.wait_for_planning_scene_object("part", timeout=6.0)
+        self.wait_for_planning_scene_object("table", timeout=6.0)
+
+        possible_grasps = self.sg.create_grasps_from_object_pose(op)
+        goal = createPickupGoal("arm_torso", "part", op, possible_grasps, self.links_to_allow_contact)
+
+        rospy.loginfo("Sending pickup goal to /pickup")
+        self.pickup_ac.send_goal(goal)
+        rospy.loginfo("Waiting for pickup result")
+        self.pickup_ac.wait_for_result()
+        result = self.pickup_ac.get_result()
+        try:
+            code = result.error_code.val
+        except Exception:
+            code = getattr(getattr(result, "error_code", None), "val", None)
+        rospy.loginfo("Pick result code: %s (%s)", str(code), str(moveit_error_dict.get(code, "UNKNOWN")))
+        return code
+
+    def _make_fallback_place_location(self, object_pose: PoseStamped) -> PlaceLocation:
+        """
+        Create a PlaceLocation that lowers by place_drop_distance, with a pre-place approach (downwards)
+        and a post-place retreat (upwards). Also sets a post_place_posture if gripper joint names/positions provided.
+        """
+        pl = PlaceLocation()
+        # place pose: lower z by configured drop distance (but don't make negative)
+        place_pose = deepcopy(object_pose)
+        try:
+            place_pose.pose.position.z = place_pose.pose.position.z - float(self.place_drop_distance)
+            if place_pose.pose.position.z < 0.01:
+                place_pose.pose.position.z = 0.01
+        except Exception:
+            pass
+        # ensure header/frame is present
+        if not getattr(place_pose, "header", None) or not place_pose.header.frame_id:
+            place_pose.header.frame_id = object_pose.header.frame_id if getattr(object_pose, "header", None) and object_pose.header.frame_id else ""
+
+        # assign to PlaceLocation
+        # PlaceLocation typically has .place_pose (PoseStamped) or .location.place_pose depending on message layout;
+        # use place_pose if available
+        try:
+            pl.place_pose = place_pose
+        except Exception:
+            try:
+                pl.location = place_pose
+            except Exception:
+                pass
+
+        # pre_place_approach: direction = -Z (approach downwards)
+        gt = GripperTranslation()
+        gvec = Vector3Stamped()
+        gvec.header.frame_id = place_pose.header.frame_id
+        gvec.vector.x = 0.0
+        gvec.vector.y = 0.0
+        gvec.vector.z = -1.0  # approach downwards in local frame
+        gt.direction = gvec
+        gt.desired_distance = float(self.preplace_desired_distance)
+        gt.min_distance = float(self.preplace_min_distance)
+        pl.pre_place_approach = gt
+
+        # post_place_retreat: retreat upwards +Z
+        retreat = GripperTranslation()
+        rvec = Vector3Stamped()
+        rvec.header.frame_id = place_pose.header.frame_id
+        rvec.vector.x = 0.0
+        rvec.vector.y = 0.0
+        rvec.vector.z = 1.0
+        retreat.direction = rvec
+        retreat.desired_distance = float(self.post_retreat_desired)
+        retreat.min_distance = float(self.post_retreat_min)
+        pl.post_place_retreat = retreat
+
+        # post_place_posture: if gripper joints/positions provided, create a JointTrajectory to open it
+        if isinstance(self.gripper_joint_names, (list, tuple)) and len(self.gripper_joint_names) > 0 \
+           and isinstance(self.gripper_open_positions, (list, tuple)) \
+           and len(self.gripper_open_positions) == len(self.gripper_joint_names):
+            jt = JointTrajectory()
+            jt.joint_names = list(self.gripper_joint_names)
+            jtp = JointTrajectoryPoint()
+            # positions must be numeric list
+            try:
+                jtp.positions = [float(v) for v in self.gripper_open_positions]
+            except Exception:
+                jtp.positions = list(self.gripper_open_positions)
+            jtp.time_from_start = rospy.Duration(1.0)
+            jt.points.append(jtp)
+            pl.post_place_posture = jt
+            rospy.loginfo("Fallback PlaceLocation will command post_place_posture on joints: %s", str(self.gripper_joint_names))
+        else:
+            # no gripper posture: leave it empty. The detached object will still be removed from planning scene
+            rospy.loginfo("No gripper_posture configured for fallback PlaceLocation (gripper will not be explicitly commanded open).")
+
+        return pl
+
+    def place_object(self, object_pose):
+        rospy.loginfo("Starting place: clearing octomap and preparing place locations")
+        try:
+            self.clear_octomap_srv.call(EmptyRequest())
+        except Exception:
+            pass
+
+        op = deepcopy(object_pose)
+        possible_placings = []
+        try:
+            possible_placings = self.sg.create_placings_from_object_pose(op) or []
+        except Exception as e:
+            rospy.logwarn("create_placings_from_object_pose failed: %s", str(e))
+            possible_placings = []
+
+        # Always append our fallback place location first (gives it priority)
+        try:
+            fallback = self._make_fallback_place_location(op)
+            # some PlaceGoal variants expect a list of PlaceLocation objects
+            possible_placings.insert(0, fallback)
+            rospy.loginfo("Inserted fallback PlaceLocation (lower-and-open attempt) into place locations")
+        except Exception as e:
+            rospy.logwarn("Failed to create fallback place location: %s", str(e))
+
+        # Try with arm only, then arm_torso
+        rospy.loginfo("Trying to place using 'arm' group (with fallback location).")
+        goal = createPlaceGoal(op, possible_placings, "arm", "part", self.links_to_allow_contact)
+        self.place_ac.send_goal(goal)
+        rospy.loginfo("Waiting for place result (arm)...")
+        self.place_ac.wait_for_result()
+        result = self.place_ac.get_result()
+        try:
+            code = result.error_code.val
+        except Exception:
+            code = getattr(getattr(result, "error_code", None), "val", None)
+
+        if code is None or str(moveit_error_dict.get(code, "")) != "SUCCESS":
+            rospy.loginfo("First place attempt not SUCCESS (code %s). Trying 'arm_torso'...", str(code))
+            goal = createPlaceGoal(op, possible_placings, "arm_torso", "part", self.links_to_allow_contact)
+            self.place_ac.send_goal(goal)
+            rospy.loginfo("Waiting for place result (arm_torso)...")
+            self.place_ac.wait_for_result()
+            result = self.place_ac.get_result()
+            try:
+                code = result.error_code.val
+            except Exception:
+                code = getattr(getattr(result, "error_code", None), "val", None)
+
+        rospy.loginfo("Place final result: %s (%s)", str(code), str(moveit_error_dict.get(code, "UNKNOWN")))
+
+        # --- Ensure detach + world removals ---
+        rospy.loginfo("Attempting to detach and remove 'part' from planning scene (defensive).")
+        try:
+            removed = False
+            try:
+                self.scene.remove_attached_object(self.end_effector_link, "part")
+                removed = True
+            except TypeError:
+                try:
+                    self.scene.remove_attached_object("part", self.end_effector_link)
+                    removed = True
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    self.scene.remove_attached_object(self.end_effector_link)
+                    removed = True
+                except Exception:
+                    pass
+            if removed:
+                rospy.loginfo("Called remove_attached_object attempts.")
+            else:
+                rospy.logwarn("remove_attached_object attempts finished (may not have removed anything).")
+        except Exception as e:
+            rospy.logwarn("Error during remove_attached_object attempts: %s", str(e))
+
+        try:
+            self.scene.remove_world_object("part")
+            rospy.loginfo("Called remove_world_object('part').")
+        except Exception as e:
+            rospy.logwarn("remove_world_object raised: %s", str(e))
+
+        try:
+            self.clear_octomap_srv.call(EmptyRequest())
+        except Exception:
+            pass
+        rospy.sleep(0.3)
+
+        # Query planning scene for debug
+        try:
+            gps_req = GetPlanningSceneRequest()
+            gps_req.components.components = gps_req.components.WORLD_OBJECT_NAMES | gps_req.components.ROBOT_STATE_ATTACHED_OBJECTS
+            gps_resp = self.scene_srv.call(gps_req)
+            world_ids = [o.id for o in gps_resp.scene.world.collision_objects]
+            attached_ids = [a.object.id for a in gps_resp.scene.robot_state.attached_collision_objects]
+            rospy.loginfo("After place, world objects: %s ; attached objects: %s", str(world_ids), str(attached_ids))
+        except Exception as e:
+            rospy.logwarn("Failed to query planning scene after place: %s", str(e))
+
+        return code
+
+
+if __name__ == '__main__':
+    rospy.init_node('pick_and_place_server')
+    paps = PickAndPlaceServer()
+    rospy.spin()

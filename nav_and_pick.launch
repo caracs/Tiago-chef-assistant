@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+  <param name="/use_sim_time" value="true"/>
+
+  <!-- Arguments -->
+  <arg name="public_sim" default="true"/>
+  <arg name="world"      default="small_office"/>
+  <arg name="rviz"       default="true"/>
+  <arg name="end_effector" default="pal-gripper"/>
+
+  <!-- Gazebo + Navigation + AMCL con PAL Gripper -->
+  <include file="$(find tiago_2dnav_gazebo)/launch/tiago_navigation.launch">
+    <arg name="public_sim" value="$(arg public_sim)"/>
+    <arg name="world"      value="$(arg world)"/>
+    <arg name="rviz"       value="$(arg rviz)"/>
+    <arg name="end_effector" value="$(arg end_effector)"/>
+  </include>
+
+  <!-- PICK PARAMS e MOTIONS -->
+  <rosparam command="load" file="$(find tiago_pick_demo)/config/pick_and_place_params.yaml" ns="/spherical_grasps_server" />
+  <rosparam command="load" file="$(find tiago_pick_demo)/config/pregrasp_motion.yaml" />
+  <rosparam command="load" file="$(find tiago_pick_demo)/config/pick_motions.yaml" />
+
+  <param name="/pick_and_place_server/object_height" value="0.06"/>
+  <param name="/pick_and_place_server/object_width"  value="0.06"/>
+  <param name="/pick_and_place_server/object_depth"  value="0.06"/>
+
+  <rosparam param="/pick_and_place_server/links_to_allow_contact">['gripper_left_finger_link', 'gripper_right_finger_link', 'gripper_link', 'arm_tool_link']</rosparam>
+  <param name="/pick_and_place_server/remove_table_before_pick" value="false"/>
+  <param name="/spherical_grasps_server/grasp_vertical_clearance" value="0.03"/>
+  <param name="/spherical_grasps_server/grasp_radius_margin" value="0.03"/>
+  <param name="/spherical_grasps_server/grasp_desired_distance" value="0.15"/>
+  <param name="/pick_and_place_server/expose_compat_services" value="false"/>
+
+  <!-- ARUCO DETECTOR -->
+  <node pkg="aruco_ros" type="single"  name="aruco_single" output="screen">
+      <remap from="/camera_info"       to="/xtion/rgb/camera_info" />
+      <remap from="/image"             to="/xtion/rgb/image_rect_color" />
+      <param name="image_is_rectified" value="True"/>
+      <param name="marker_size"        value="0.045"/>
+      <param name="marker_id"          value="582"/>
+      <param name="reference_frame"    value="base_footprint"/>
+      <param name="camera_frame"       value="xtion_rgb_optical_frame"/>
+      <param name="marker_frame"       value="aruco_frame" />
+      <param name="corner_refinement"  value="SUBPIX" />
+  </node>
+
+  <!-- PICK SERVERS / CLIENT -->
+  <node pkg="tiago_pick_demo" type="spherical_grasps_server.py" name="spherical_grasps_server" output="screen" respawn="false">
+    <param name="object_pose_subscribe_topic" value="/detected_aruco_pose" />
+    <param name="debug_mode" value="false" />
+  </node>
+
+  <node pkg="tiago_pick_demo" type="pick_and_place_server.py" name="pick_and_place_server" output="screen" respawn="false">
+    <rosparam command="load" file="$(find tiago_pick_demo)/config/pick_and_place_params.yaml" />
+    <param name="object_height" value="0.06"/>
+    <param name="object_width"  value="0.06"/>
+    <param name="object_depth"  value="0.06"/>
+  </node>
+
+  <node pkg="tiago_pick_demo" type="pick_client.py" name="pick_aruco_demo" output="screen" respawn="false">
+    <param name="aruco_topic" value="/aruco_single/pose" />
+    <param name="aruco_wait_timeout" value="15.0" />
+    <param name="base_frame" value="base_footprint" />
+  </node>
+
+  <!-- POINTCLOUD THROTTLE & OCTOMAP -->
+  <node pkg="topic_tools" type="throttle" name="throttle_points"
+        args="messages /xtion/depth_registered/points 3 /throttle_filtering_points/filtered_points" />
+
+  <node pkg="octomap_server" type="octomap_server_node" name="octomap_server" output="screen" respawn="true">
+    <param name="frame_id" value="odom"/>
+    <param name="resolution" value="0.05"/>
+    <param name="point_cloud_topic" value="/throttle_filtering_points/filtered_points"/>
+    <remap from="cloud_in" to="/throttle_filtering_points/filtered_points"/>
+  </node>
+
+  <rosparam command="load" file="$(find tiago_moveit_tutorial)/config/tiago_octomap_motions.yaml" />
+
+  <group if="$(arg rviz)">
+    <node name="octomap_rviz" pkg="rviz" type="rviz"
+          args="-d $(find tiago_moveit_tutorial)/config/rviz/occlusion_octomap.rviz" />
+  </group>
+
+  <!-- OBSERVATION SOURCES & VIRTUAL LASER -->
+  <rosparam param="/move_base/local_costmap/observation_sources">head_xtion xtion_scan</rosparam>
+  <rosparam param="/move_base/local_costmap/head_xtion/sensor_frame">xtion_rgb_optical_frame</rosparam>
+  <rosparam param="/move_base/local_costmap/head_xtion/data_type">PointCloud2</rosparam>
+  <rosparam param="/move_base/local_costmap/head_xtion/topic">/throttle_filtering_points/filtered_points</rosparam>
+  <rosparam param="/move_base/local_costmap/head_xtion/marking">false</rosparam>
+  <rosparam param="/move_base/local_costmap/head_xtion/clearing">true</rosparam>
+  <rosparam param="/move_base/local_costmap/head_xtion/expected_update_rate">5.0</rosparam>
+
+  <rosparam param="/move_base/local_costmap/xtion_scan/sensor_frame">xtion_rgb_optical_frame</rosparam>
+  <rosparam param="/move_base/local_costmap/xtion_scan/data_type">LaserScan</rosparam>
+  <rosparam param="/move_base/local_costmap/xtion_scan/topic">/xtion_depth_scan</rosparam>
+  <rosparam param="/move_base/local_costmap/xtion_scan/marking">true</rosparam>
+  <rosparam param="/move_base/local_costmap/xtion_scan/clearing">true</rosparam>
+
+  <rosparam param="/move_base/global_costmap/observation_sources">xtion_scan</rosparam>
+  <rosparam param="/move_base/global_costmap/xtion_scan/sensor_frame">xtion_rgb_optical_frame</rosparam>
+  <rosparam param="/move_base/global_costmap/xtion_scan/data_type">LaserScan</rosparam>
+  <rosparam param="/move_base/global_costmap/xtion_scan/topic">/xtion_depth_scan</rosparam>
+  <rosparam param="/move_base/global_costmap/xtion_scan/marking">true</rosparam>
+  <rosparam param="/move_base/global_costmap/xtion_scan/clearing">true</rosparam>
+
+  <node pkg="depthimage_to_laserscan" type="depthimage_to_laserscan" name="xtion_depthimage_to_laserscan" output="screen">
+    <param name="depth_image" value="/xtion/depth_registered/image_raw"/>
+    <param name="depth_camera_info" value="/xtion/depth_registered/camera_info"/>
+    <param name="scan" value="/xtion_depth_scan"/>
+    <param name="output_frame_id" value="xtion_rgb_optical_frame"/>
+    <param name="range_min" value="0.3"/>
+    <param name="range_max" value="4.0"/>
+    <param name="scan_time" value="0.05"/>
+    <param name="angle_min" value="-1.3"/>
+    <param name="angle_max" value="1.3"/>
+    <param name="use_inf" value="false"/>
+    <param name="inf_epsilon" value="1.0"/>
+  </node>
+
+  <rosparam param="octomap_topic" command="load">/octomap_full</rosparam>
+  <rosparam file="$(find tiago_2dnav_gazebo)/param/costmap_common_params.yaml" command="load"/>
+
+  <rosparam>
+    obstacle_layer:
+      observation_sources: head_xtion
+      head_xtion:
+        sensor_frame: head_xtion_rgb_optical_frame
+        data_type: PointCloud2
+        topic: /throttle_filtering_points/filtered_points
+        marking: true
+        clearing: true
+  </rosparam>
+
+  <!-- ========== SEMANTIC PLACES (same param used by NL-to-goal) ========== -->
+  <rosparam param="/semantic_places">
+    { tavolo1: [0.223, -6.820, 0.0, 3.14159], dispensa: [-2.419, 0.692, 0.0, 1.5708], tavolo2: [0.223, -8.810, 0.0, 3.14159], office: [0.0, -1.2, 0.0, 0.0] }
+  </rosparam>
+
+  <!-- NOTE: semantici e altri nodi pesanti NON inclusi in questo launch per risparmiare risorse -->
+  <!-- Avvia i nodi semantici con il launch separato (semantic_nodes.launch) oppure individualmente -->
+</launch>
